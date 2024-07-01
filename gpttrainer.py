@@ -24,13 +24,18 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B,T,self.n_head, C//self.n_head).transpose(1,2)
         v = v.view(B,T,self.n_head, C//self.n_head).transpose(1,2)
 
-        att = (q @ k.transpose(-2,-1)) * (1.0/(C//self.n_head)**0.5)
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att = F.softmax(att, dim=-1)
-        y = att @ v
+        #att = (q @ k.transpose(-2,-1)) * (1.0/(C//self.n_head)**0.5)
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        #att = F.softmax(att, dim=-1)
+        #y = att @ v
+        y = F.scaled_dot_product_attention(q, k, v, is_casual=True)
         y = y.transpose(1,2).contiguous().view(B,T,C)
         y = self.c_proj(y)
         return y
+import math 
+class TanhGELU(nn.Module):
+    def forward(self,input):
+        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
 class MLP(nn.Module):
     def __init__(self,config):
         super().__init__()
@@ -164,25 +169,64 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
         return model 
     
+    def configure_optimizers(self, weight_decay, learning_rate,device):
+        param_dict = {pn:p for pn, p in self.named_parameters()}
+        param_dict = {pn:p for pn, p in param_dict.items() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"num decay params = {num_decay_params}")
+        print(f"num nodecay params = {num_nodecay_params}")
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and 'cuda' in device
+        print(f"using fused adam = {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+    
 num_return_sequences = 5
 max_length = 30
 
-train_loader = DataLoaderLite(B=4, T=32)
-
-model = GPT(ModelConfig())
+train_loader = DataLoaderLite(B=16, T=1024)
+torch.set_float32_matmul_precision('high')
+model = GPT(ModelConfig(vocab_size=50304))
 model.to("mps")
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range(50):
+model = torch.compile(model)
+max_lr = 6e-4
+min_lr = max_lr *0.1
+warmup_steps = 10
+max_steps = 50
+
+def get_lr(it):
+    if it < warmup_steps:
+        return max_lr*(it+1)/warmup_steps
+    if it > max_steps:
+        return min_lr 
+    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
+    coeff = 0.5*(1.0+math.cos(math.pi*decay_ratio))
+    return min_lr + coeff*(max_lr - min_lr)
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+for step in range(max_steps):
     x, y = train_loader.next_batch()
     x = x.to("mps")
     y = y.to("mps")
     optimizer.zero_grad()
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        logits, loss = model(x,y)
+        import code; code.interact(local=locals())
     logits, loss = model(x,y)
     loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
     optimizer.step()
-    print(f"step {i} loss {loss.item()}")
-print(loss)
-import sys; sys.exit(0)
+    torch.cuda.synchronize()
+    print(f"step {i} norm{norm:.4f}loss {loss.item()}")
 
 while x.size(1) < max_length:
     with torch.no_grad():

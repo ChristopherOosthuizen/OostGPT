@@ -2,6 +2,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.distributed as dist
 
 class CausalSelfAttention(nn.Module):
     def __init__(self,config):
@@ -74,7 +77,7 @@ class DataLoaderLite:
         print(f"loaded {len(self.tokens)} tokens")
         print(f"epoch = {len(self.tokens)//(B*T)} batches")
 
-        self.current_position = 0
+        self.current_position = self.B*self.T*self.process_rank
     def next_batch(self):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position:self.current_position+B*T+1]
@@ -83,7 +86,7 @@ class DataLoaderLite:
         self.current_position += B*T
 
         if self.current_position + B*T >= len(self.tokens):
-            self.current_position = 0
+            self.current_position = self.B*self.T*self.process_rank
         return x,y
 @dataclass
 class ModelConfig:
@@ -187,15 +190,45 @@ class GPT(nn.Module):
         print(f"using fused adam = {use_fused}")
         optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
         return optimizer
-    
+from torch.distributed import init_process_group, destroy_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
+import os 
+ddp = int(os.environ.get("RANK", -1)) != -1
+if ddp:
+    init_process_group(backend='nccl')
+    ddp_rank = int(os.environ['RANK'])
+    ddp_local_rank = int(os.environ['LOCAL_RANK'])
+    ddp_world_size = int(os.environ['WORLD_SIZE'])
+    device= f"cuda:{ddp_local_rank}"
+    torch.cuda.set_device(device)
+    master_process = ddp_rank == 0
+else:
+    ddp_rank = 0
+    ddp_local_rank = 0
+    ddp_world_size = 1
+    master_process = True
+    device = "cuda"
 num_return_sequences = 5
 max_length = 30
+
+total_batch_size = 524288
+B=16
+T=1024
+grad_accum_steps = total_batch_size // (B*T*ddp_world_size)
+if master_process:
+    print(f"grad_accum_steps:{grad_accum_steps}")
+
+print(f"total desired batch size:{total_batch_size}")
+print(f"grad_accum_steps:{grad_accum_steps}")
 
 train_loader = DataLoaderLite(B=16, T=1024)
 torch.set_float32_matmul_precision('high')
 model = GPT(ModelConfig(vocab_size=50304))
 model.to("mps")
 model = torch.compile(model)
+if ddp:
+    model = DDP(model, device_ids=[ddp_local_rank])
+raw_model = model.module if ddp else model
 max_lr = 6e-4
 min_lr = max_lr *0.1
 warmup_steps = 10
@@ -209,24 +242,39 @@ def get_lr(it):
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
     coeff = 0.5*(1.0+math.cos(math.pi*decay_ratio))
     return min_lr + coeff*(max_lr - min_lr)
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=0.0, device=device)
+import time 
 for step in range(max_steps):
-    x, y = train_loader.next_batch()
-    x = x.to("mps")
-    y = y.to("mps")
+    t0 = time.time()
     optimizer.zero_grad()
-    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-        logits, loss = model(x,y)
-        import code; code.interact(local=locals())
-    logits, loss = model(x,y)
-    loss.backward()
+    loss_accum = 0.0
+    for micro_step in range(grad_accum_steps):
+        x,y = train_loader.next_batch()
+        x = x.to("cuda")
+        y = y.to("cuda")
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            logits, loss = model(x,y)
+        loss = loss / grad_accum_steps
+        loss_accum += loss.detach()
+        if ddp:
+            model.require_backward_grad_sync = (micro_step == grad_accum_steps - 1)
+        loss.backward()
+    if ddp:
+        dist.all_reduce(loss_accum,op=dist.ReduceOp.AVG)
     norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
     lr = get_lr(step)
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
     optimizer.step()
     torch.cuda.synchronize()
-    print(f"step {i} norm{norm:.4f}loss {loss.item()}")
+    t1 = time.time()
+    tokens_processed = train_loader.B * train_loader.T * grad_accum_steps*ddp_world_size
+    tokens_per_sec = tokens_processed / (t1-t0)
+    if master_process:
+        print(f"step {step:4d} | loss {loss_accum.item():.6f} | lr {lr:.6f} | norm: {norm:.4f} | dt: {dt*} tokens/sec {tokens_per_sec:.0f}")
+
+if ddp:
+    destroy_process_group()
 
 while x.size(1) < max_length:
     with torch.no_grad():

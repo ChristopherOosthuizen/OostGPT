@@ -265,10 +265,10 @@ model.to("cuda")
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
-max_lr = 6e-4
+max_lr = 6e-4*3
 min_lr = max_lr *0.1
-warmup_steps = 715
-max_steps = 19073
+warmup_steps = 100
+max_steps = 19073*2
 
 def get_lr(it):
     if it < warmup_steps:
@@ -308,6 +308,16 @@ for step in range(max_steps):
             print(f"validation loss: {val_loss_accum.item():.4f}")
             with open(log_file, "a") as f:
                 f.write(f"{step} val {val_loss_accum.item():.4f}\n")
+            if step > 0 and (step %5000 == 0 or last_step):
+                checkpoint_path = os.path.join(log_dir,f"model_{step:05d}.pt")
+                checkpoint = {
+                    'model': raw_model.state_dict(),
+                    'config': raw_model.config,
+                    'step':step,
+                    'val_loss': val_loss_accum.item()
+                }
+                print(checkpoint_path)
+                torch.save(checkpoint,checkpoint_path)
     if (step%250 == 0 or last_step):
         num_correct_norm = 0
         num_total = 0
@@ -319,13 +329,13 @@ for step in range(max_steps):
         tokens = tokens.to("cuda")
         mask = mask.to("cuda")
         with torch.no_grad():
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits, loss = model(tokens)
             pred_norm = get_most_likely_row(tokens,mask, logits)
         num_total += 1
         num_correct_norm += int(pred_norm == label)
         if ddp:
-            num_total = torch.tensor(num_total,dtype=torch.long,device="cude")
+            num_total = torch.tensor(num_total,dtype=torch.long,device="cuda")
             num_correct_norm = torch.tensor(num_correct_norm, dtype=torch.long, device="cuda")
             dist.all_reduce(num_total, op=dist.ReduceOp.SUM)
             dist.all_reduce(num_correct_norm, op=dist.ReduceOp.SUM)

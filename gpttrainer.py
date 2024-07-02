@@ -5,7 +5,7 @@ from torch.nn import functional as F
 from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
-
+import inspect
 class CausalSelfAttention(nn.Module):
     def __init__(self,config):
         super().__init__()
@@ -31,7 +31,7 @@ class CausalSelfAttention(nn.Module):
         #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         #att = F.softmax(att, dim=-1)
         #y = att @ v
-        y = F.scaled_dot_product_attention(q, k, v, is_casual=True)
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         y = y.transpose(1,2).contiguous().view(B,T,C)
         y = self.c_proj(y)
         return y
@@ -67,9 +67,10 @@ class Block(nn.Module):
         return x
 import tiktoken
 class DataLoaderLite:
-    def __init__(self,B,T):
+    def __init__(self,B,T,process_rank):
         self.B = B
         self.T = T
+        self.process_rank = process_rank
         self.enc = tiktoken.get_encoding("gpt2")
         text = open("input.txt").read()
         tokens = self.enc.encode(text)
@@ -194,8 +195,9 @@ from torch.distributed import init_process_group, destroy_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 import os 
 ddp = int(os.environ.get("RANK", -1)) != -1
+backend='nccl'
 if ddp:
-    init_process_group(backend='nccl')
+    init_process_group(backend=backend)
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
@@ -221,11 +223,10 @@ if master_process:
 print(f"total desired batch size:{total_batch_size}")
 print(f"grad_accum_steps:{grad_accum_steps}")
 
-train_loader = DataLoaderLite(B=16, T=1024)
+train_loader = DataLoaderLite(B=16, T=1024,process_rank=ddp_rank)
 torch.set_float32_matmul_precision('high')
 model = GPT(ModelConfig(vocab_size=50304))
-model.to("mps")
-model = torch.compile(model)
+model.to("cuda")
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module if ddp else model
@@ -242,7 +243,7 @@ def get_lr(it):
     decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
     coeff = 0.5*(1.0+math.cos(math.pi*decay_ratio))
     return min_lr + coeff*(max_lr - min_lr)
-optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=0.0, device=device)
+optimizer = raw_model.configure_optimizers(weight_decay=0.1, learning_rate=6e-4, device="cuda")
 import time 
 for step in range(max_steps):
     t0 = time.time()
@@ -268,10 +269,11 @@ for step in range(max_steps):
     optimizer.step()
     torch.cuda.synchronize()
     t1 = time.time()
+    dt = t1-t0
     tokens_processed = train_loader.B * train_loader.T * grad_accum_steps*ddp_world_size
     tokens_per_sec = tokens_processed / (t1-t0)
     if master_process:
-        print(f"step {step:4d} | loss {loss_accum.item():.6f} | lr {lr:.6f} | norm: {norm:.4f} | dt: {dt*} tokens/sec {tokens_per_sec:.0f}")
+        print(f"step {step:4d} | loss {loss_accum.item():.6f} | lr {lr:.6f} | norm: {norm:.4f} | dt: {dt*1000} tokens/sec {tokens_per_sec:.0f}")
 
 if ddp:
     destroy_process_group()
@@ -285,7 +287,7 @@ while x.size(1) < max_length:
         ix = torch.multinomial(topk_probs, 1)
         xcol = torch.gather(topk_indices, -1, ix)
         x = torch.cat((x, xcol), dim=1)
-
+enc = tiktoken.get_encoding("gpt2")
 for i in range(num_return_sequences):
     tokens = x[i, :max_length].tolist()
     decoded = enc.decode(tokens)
